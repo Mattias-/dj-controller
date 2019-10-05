@@ -1,5 +1,6 @@
 #!/bin/bash
 set -eo pipefail
+#set -x
 
 if [ "$1" == "-v" ]; then
     set -x
@@ -27,11 +28,12 @@ sp_curl() {
 }
 
 normalize_str() {
-    S=${1// /-}                                 # remove spaces from $1
-    S=${S//:/-}                                 # replace : with -
-    S=$(echo "$S" | tr "[:upper:]" "[:lower:]") # lowercase
-    S=$(echo "$S" | LANG=c tr -cd '[:print:]')  # remove non ascii characters
-    S=$(echo "$S" | cut -c-253)                 # trim to max 253 characters
+    #S=${1// /-}                                  # remove spaces from $1
+    #S=${S//:/-}                                  # replace : with -
+    S=$1
+    S=$(echo "$S" | tr "[:upper:]" "[:lower:]")  # lowercase
+    S=$(echo "$S" | tr -cd '[:lower:][:digit:]') # remove non ascii characters
+    S=$(echo "$S" | cut -c-253)                  # trim to max 253 characters
     echo "$S"
 }
 
@@ -63,18 +65,6 @@ now_playing() {
     sp_curl "https://api.spotify.com/v1/me/player"
 }
 
-find_pod() {
-    track=$1
-    n_kubectl get pods -ojson |
-        jq -r ".items[] | select(.metadata.ownerReferences[].name == \"$track\")"
-}
-
-find_pod_name() {
-    track=$1
-    track_name="$(jq -r '.metadata.name' <<<"$track")"
-    find_pod "$track_name" | jq -r ".metadata.name"
-}
-
 print_n_x() {
     pad="$(printf '%*s' "$1")"
     echo -n "${pad// /$2}"
@@ -91,22 +81,22 @@ progress_bar() {
 manage() {
     track=$1
 
-    declare -xg TRACK_NAME
     TRACK_NAME="$(jq -r '.metadata.name' <<<"$track")"
     echo 1>&2 "Create pod for new track: $TRACK_NAME"
 
-    declare -xg TRACK_UID
     TRACK_UID="$(jq -r '.metadata.uid' <<<"$track")"
 
-    declare -x TRACK_URI
     TRACK_URI="$(jq -r '.spec.uri' <<<"$track")"
     normalized_track_uri="$(normalize_str "${TRACK_URI/spotify:track:/}")"
 
-    declare -x POD_NAME
-    POD_NAME="${TRACK_NAME}-${normalized_track_uri}-"
+    POD_NAME="${TRACK_NAME}-${normalized_track_uri}"
 
-    envsubst <"$DIR/template/pod.tmpl.yaml" |
-        n_kubectl create -f -
+    POD_NAME=$POD_NAME \
+        TRACK_UID=$TRACK_UID \
+        TRACK_NAME=$TRACK_NAME \
+        TRACK_URI=$TRACK_URI \
+        envsubst <"$DIR/template/pod.tmpl.yaml" |
+        n_kubectl apply -f -
 }
 
 update_track_info() {
@@ -145,11 +135,10 @@ EOF
 
 update_track_progress() {
     track=$1
+    pod=$2
 
     track_name="$(jq -r '.metadata.name' <<<"$track")"
     #echo 1>&2 "Update track progress: $track_name"
-
-    pod=$(find_pod "$track_name")
 
     duration_ms="$(jq -r '.status.track.duration_ms' <<<"$track")"
     progress_ms="0"
@@ -213,26 +202,95 @@ EOF
     fi
 }
 
-control() {
-    n_kubectl get tr -ojson |
-        jq --compact-output -r '.items[]' |
-        while read -r track; do
-            phase="$(jq -r '.status.phase' <<<"$track")"
-            if [[ "$phase" == "Done" ]]; then
-                # Don't do anything with tracks that are Done
-                :
-            elif [[ $(find_pod_name "$track") == "" ]]; then
-                # A new track. Let the controller manage it.
-                manage "$track"
-                update_track_info "$track"
-            else
-                update_track_progress "$track"
-            fi
-        done
+get_pod() {
+    track_name=$1
+    jq -r ".items[] | select(.metadata.ownerReferences[].name == \"$track_name\")" </tmp/pods
 }
 
-while true; do
-    sleep 5
-    time control
-    echo "control loop ran"
-done
+control_one() {
+    track="$1"
+    phase="$(jq -r '.status.phase' <<<"$track")"
+    if [[ "$phase" == "Done" ]]; then
+        # Don't do anything with tracks that are Done
+        return
+    fi
+
+    track_name="$(jq -r '.metadata.name' <<<"$track")"
+    pod=$(get_pod "$track_name")
+    pod_name=$(jq -r '.metadata.name' <<<"$pod")
+
+    if [[ "$pod_name" == "" ]]; then
+        # A new track. Let the controller manage it.
+        manage "$track"
+        update_track_info "$track"
+    else
+        # phase is Playing or Queued
+        update_track_progress "$track" "$pod"
+    fi
+}
+
+control() {
+    n_kubectl get pods -l dj-kubelet/spotify-track -ojson >/tmp/pods
+    n_kubectl get tracks -ojson >/tmp/tracks
+
+    # Control running
+    #running_track_name=$(jq -r '.items[] | select(.status.phase == "Running") | .metadata.ownerReferences[0].name' </tmp/pods)
+    #control_one "$running_track_name"
+
+}
+
+control_queued() {
+    # Control Queued
+    time {
+        jq --compact-output -r '.items[] | select(.status.phase == "Queued")' </tmp/tracks |
+            while read -r track; do
+                control_one "$track"
+            done
+    }
+    echo "Controlled queued"
+
+}
+
+control_not_queued() {
+    n_kubectl get pods -l dj-kubelet/spotify-track -ojson >/tmp/pods
+    n_kubectl get tracks -ojson >/tmp/tracks
+    # Control Not Queued
+    time {
+        jq --compact-output -r '.items[] | select(.status.phase != "Queued")' </tmp/tracks |
+            while read -r track; do
+                control_one "$track"
+            done
+    }
+    echo "Controlled not queued"
+}
+
+control_playing() {
+    # Control playing
+    time {
+        running_track_name=$(jq -r '.items[] | select(.status.phase == "Running") | .metadata.ownerReferences[0].name' </tmp/pods)
+        if [[ "$running_track_name" != "" ]]; then
+            control_one "$running_track_name"
+        fi
+    }
+    echo "Controlled playing"
+}
+
+forever() {
+    sleep_time=$1
+    cmd=$2
+    while true; do
+        sleep "$sleep_time"
+        $cmd
+    done
+}
+
+main() {
+    n_kubectl get pods -l dj-kubelet/spotify-track -ojson >/tmp/pods
+    n_kubectl get tracks -ojson >/tmp/tracks
+
+    forever 2 control_not_queued &
+    forever 2 control_playing &
+    forever 10 control_queued &
+    wait
+}
+main
